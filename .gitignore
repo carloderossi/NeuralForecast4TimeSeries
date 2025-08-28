@@ -1,0 +1,6 @@
+# Ignore chronos_model_ followed by 1 or more digits (with or without extension)
+chronos_model_[0-9]*
+
+*.zip
+BCKUP/*
+__pycache__/
