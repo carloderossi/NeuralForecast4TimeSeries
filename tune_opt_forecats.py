@@ -193,11 +193,35 @@ from neuralforecast import NeuralForecast
 from neuralforecast.models import TCN as NFTCN
 
 def eval_nf_tcn(trial):
+    """
+    Evaluate a NeuralForecast Temporal Convolutional Network (TCN) model
+    using an **in-sample backtest** on the August hold-out period.
+
+    Why backtest?
+    -------------
+    Normally, you train on past data (train_df) and forecast into *future*
+    dates (val_df). But here, we don't have actual future data beyond
+    2025-08-31 (i.e., no September actuals). True out-of-sample (OOS)
+    evaluation isn't possible.
+
+    So instead, we:
+      • Append the 'validation' period (August) to the training set
+      • Fit the model on that full range
+      • Use `predict_insample()` to get fitted values for *every* date
+        in the training range, including August.
+      • Merge those fitted predictions with the original August actuals
+        (your val_df) and compute the MAE.
+
+    This produces a *backtest* score: it tells you how well the model
+    fits known data in the August period, not how well it would generalize
+    to unseen future data.
+    """
+
     global train_df, val_df, versions, horizon
 
-    print("🧪 Evaluating NeuralForecast TCN model (in‑sample August backtest)...")
+    print("🧪 Evaluating NeuralForecast TCN model (in-sample backtest on August hold-out)...")
 
-    # 1️⃣ Hyperparameters
+    # 1️⃣ Hyperparameters from Optuna search space
     input_size    = trial.suggest_int("nf_input_size", 30, 180)
     num_blocks    = trial.suggest_int("nf_num_blocks", 1, 5)
     num_layers    = trial.suggest_int("nf_num_layers", 1, 4)
@@ -208,47 +232,76 @@ def eval_nf_tcn(trial):
     lr            = trial.suggest_loguniform("nf_lr", 1e-4, 1e-2)
     batch_size    = trial.suggest_categorical("nf_batch_size", [32, 64, 128])
 
-    # 2️⃣ Build model
+    # 2️⃣ Build the model
     tcn_model = NFTCN(
         input_size=input_size,
-        h=horizon,
+        h=horizon,                 # horizon is not used for in-sample fit,
+                                    # but required by the model init
         kernel_size=kernel_size,
         batch_size=batch_size
     )
     nf = NeuralForecast(models=[tcn_model], freq="D")
 
-    # 3️⃣ Train
-    nf.fit(df=train_df.copy(), verbose=False)
+    # 3️⃣ Combine train_df and val_df so August is in training data
+    full_train_df = pd.concat([train_df, val_df], ignore_index=True)
 
-    # 4️⃣ In‑sample predictions for the training data
-    print("🔍 Getting in‑sample predictions…")
-    preds_insample = nf.predict_insample()  # no df= in this version
+    # 4️⃣ Fit model on the full dataset (so August is in-sample)
+    nf.fit(df=full_train_df.copy(), verbose=False)
 
-    # 5️⃣ Normalise key types
+    # 5️⃣ Get fitted values for all in-sample dates
+    print("🔍 Getting in-sample predictions (fitted values for training period)...")
+    preds_insample = nf.predict_insample()  # returns predictions for entire fitted range
+
+    # 6️⃣ Prepare for merge: normalize keys
     val_df_c = val_df.copy()
     val_df_c["unique_id"] = val_df_c["unique_id"].astype(str)
     preds_insample["unique_id"] = preds_insample["unique_id"].astype(str)
     val_df_c["ds"] = pd.to_datetime(val_df_c["ds"])
     preds_insample["ds"] = pd.to_datetime(preds_insample["ds"])
 
-    # 6️⃣ Detect forecast column dynamically
-    forecast_col = preds_insample.columns.difference(["unique_id", "ds"])[0]
+    # 7️⃣ Detect forecast column (model name) dynamically
+    forecast_col = preds_insample.columns.difference(["unique_id", "ds", "y"])[0]
 
-    # 7️⃣ Merge fitted values with August validation window
-    merged = val_df_c.merge(preds_insample, on=["ds", "unique_id"], how="inner")
-    merged = merged.dropna(subset=["y", forecast_col])
+    # 8️⃣ Merge actuals (val_df) with in-sample predictions
+    # Use suffixes to keep columns distinct if 'y' exists in both
+    merged = val_df_c.merge(
+        preds_insample,
+        on=["ds", "unique_id"],
+        how="inner",
+        suffixes=("_actual", "_pred")
+    )
 
+    # Debug: overlap inspection
+    print("⚠️ Merged columns:", merged.columns.tolist())
+    overlap_count = len(
+        set(zip(val_df_c["unique_id"], val_df_c["ds"])) &
+        set(zip(preds_insample["unique_id"], preds_insample["ds"]))
+    )
+    print(f"🔍 Overlapping (unique_id, ds) pairs: {overlap_count}")
+    if overlap_count == 0:
+        print("⚠️ No overlap found — check date alignment or preds_insample output.")
+        return 1e6  # penalty
+
+    # 9️⃣ Select the actuals column from the merge
+    actual_col_candidates = [c for c in merged.columns if c.endswith("_actual")]
+    if not actual_col_candidates:
+        print("⚠️ No actuals column found after merge — penalty")
+        return 1e6
+    actual_col = actual_col_candidates[0]
+
+    # 🔟 Drop rows with NaNs in either actuals or forecasts
+    merged = merged.dropna(subset=[actual_col, forecast_col])
     if merged.empty:
-        print("⚠️ No overlap between val_df and in‑sample predictions — returning penalty")
+        print("⚠️ After dropping NaNs, nothing left to score — penalty")
         return 1e6
 
-    # 8️⃣ Per‑ID MAE and average
+    # 1️⃣1️⃣ Compute MAE per ID and average them equally
     per_id_mae = merged.groupby("unique_id").apply(
-        lambda g: mean_absolute_error(g["y"], g[forecast_col])
+        lambda g: mean_absolute_error(g[actual_col], g[forecast_col])
     )
     avg_mae = per_id_mae.mean()
 
-    print(f"📈 Per‑ID MAEs:\n{per_id_mae}\n🔹 Average MAE: {avg_mae}")
+    print(f"📈 Per-ID MAEs:\n{per_id_mae}\n🔹 Average MAE: {avg_mae}")
     return avg_mae
 
 ## --------------------------------------------------------------------------------
@@ -384,6 +437,9 @@ def main():
     print("\n📅 Validation date ranges by unique_id:")
     print(val_df.groupby("unique_id")["ds"].agg(['min', 'max']))
     print("\n")
+
+    print(val_df.columns)
+    print(val_df.head())
 
     versions = df["unique_id"].unique().tolist()
     print(f"🧬 Found {len(versions)} unique versions.")
