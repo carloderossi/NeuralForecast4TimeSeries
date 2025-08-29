@@ -195,7 +195,7 @@ from neuralforecast.models import TCN as NFTCN
 def eval_nf_tcn(trial):
     global train_df, val_df, versions, horizon
 
-    print("🧪 Evaluating NeuralForecast TCN model...")
+    print("🧪 Evaluating NeuralForecast TCN model (in‑sample August backtest)...")
 
     # 1️⃣ Hyperparameters
     input_size    = trial.suggest_int("nf_input_size", 30, 180)
@@ -208,8 +208,7 @@ def eval_nf_tcn(trial):
     lr            = trial.suggest_loguniform("nf_lr", 1e-4, 1e-2)
     batch_size    = trial.suggest_categorical("nf_batch_size", [32, 64, 128])
 
-    # 2️⃣ Model
-    print("📐 Building NeuralForecast TCN model...")
+    # 2️⃣ Build model
     tcn_model = NFTCN(
         input_size=input_size,
         h=horizon,
@@ -219,63 +218,37 @@ def eval_nf_tcn(trial):
     nf = NeuralForecast(models=[tcn_model], freq="D")
 
     # 3️⃣ Train
-    print(f"🏋️ Training with lr={lr} bs={batch_size}…")
     nf.fit(df=train_df.copy(), verbose=False)
 
-    # 4️⃣ Build aligned evaluation set with fallback
-    print("🔧 Aligning validation set…")
-    full_df = pd.concat([train_df, val_df], ignore_index=True)
-    aligned_slices = []
+    # 4️⃣ In‑sample predictions for the training data
+    print("🔍 Getting in‑sample predictions…")
+    preds_insample = nf.predict_insample()  # no df= in this version
 
-    for uid in train_df["unique_id"].unique():
-        last_train_date = train_df.loc[train_df["unique_id"] == uid, "ds"].max()
+    # 5️⃣ Normalise key types
+    val_df_c = val_df.copy()
+    val_df_c["unique_id"] = val_df_c["unique_id"].astype(str)
+    preds_insample["unique_id"] = preds_insample["unique_id"].astype(str)
+    val_df_c["ds"] = pd.to_datetime(val_df_c["ds"])
+    preds_insample["ds"] = pd.to_datetime(preds_insample["ds"])
 
-        actual_after_train = full_df[
-            (full_df["unique_id"] == uid) &
-            (full_df["ds"] > last_train_date)
-        ].sort_values("ds")
+    # 6️⃣ Detect forecast column dynamically
+    forecast_col = preds_insample.columns.difference(["unique_id", "ds"])[0]
 
-        if not actual_after_train.empty:
-            # Clip to available days after train
-            clip_h = min(horizon, len(actual_after_train))
-            sub = actual_after_train.head(clip_h).copy()
-            print(f"ℹ️ {uid}: Using {clip_h} OOS days after {last_train_date.date()}")
-        else:
-            # Fallback: last N days of training set
-            sub = train_df[train_df["unique_id"] == uid].sort_values("ds").tail(horizon).copy()
-            print(f"⚠️ {uid}: No OOS actuals, using last {len(sub)} in‑sample days ending {last_train_date.date()} for backtest")
-
-        aligned_slices.append(sub)
-
-    aligned_eval_df = pd.concat(aligned_slices, ignore_index=True)
-
-    # 5️⃣ Forecast for the chosen evaluation rows
-    print("🔍 Forecasting…")
-    preds = nf.predict(df=aligned_eval_df.copy())
-
-    # 6️⃣ Normalise join keys
-    aligned_eval_df["unique_id"] = aligned_eval_df["unique_id"].astype(str)
-    preds["unique_id"]           = preds["unique_id"].astype(str)
-    aligned_eval_df["ds"]        = pd.to_datetime(aligned_eval_df["ds"])
-    preds["ds"]                  = pd.to_datetime(preds["ds"])
-
-    forecast_col = preds.columns.difference(["unique_id", "ds"])[0]
-
-    # 7️⃣ Merge & drop missing
-    merged = aligned_eval_df.merge(preds, on=["ds", "unique_id"], how="inner")
+    # 7️⃣ Merge fitted values with August validation window
+    merged = val_df_c.merge(preds_insample, on=["ds", "unique_id"], how="inner")
     merged = merged.dropna(subset=["y", forecast_col])
 
     if merged.empty:
-        print("⚠️ Even fallback found no overlap — returning large penalty")
+        print("⚠️ No overlap between val_df and in‑sample predictions — returning penalty")
         return 1e6
 
-    # 8️⃣ Per-ID MAE average
+    # 8️⃣ Per‑ID MAE and average
     per_id_mae = merged.groupby("unique_id").apply(
         lambda g: mean_absolute_error(g["y"], g[forecast_col])
     )
     avg_mae = per_id_mae.mean()
 
-    print(f"📈 Per-ID MAEs:\n{per_id_mae}\n🔹 Average MAE: {avg_mae}")
+    print(f"📈 Per‑ID MAEs:\n{per_id_mae}\n🔹 Average MAE: {avg_mae}")
     return avg_mae
 
 ## --------------------------------------------------------------------------------
@@ -403,7 +376,15 @@ def main():
 
     print(f"🧮 Training set: {train_df.shape[0]} rows")
     print(f"🧮 Validation set: {val_df.shape[0]} rows")
-    
+
+    # 🖨 Print min/max date per series for train & val
+    print("\n📅 Training date ranges by unique_id:")
+    print(train_df.groupby("unique_id")["ds"].agg(['min', 'max']))
+
+    print("\n📅 Validation date ranges by unique_id:")
+    print(val_df.groupby("unique_id")["ds"].agg(['min', 'max']))
+    print("\n")
+
     versions = df["unique_id"].unique().tolist()
     print(f"🧬 Found {len(versions)} unique versions.")
 
