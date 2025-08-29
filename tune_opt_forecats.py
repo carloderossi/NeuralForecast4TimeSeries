@@ -191,10 +191,11 @@ from neuralforecast import NeuralForecast
 from neuralforecast.models import TCN as NFTCN
 
 def eval_nf_tcn(trial):
-    global train_df, val_df, versions, horizon  # tell Python to use the globals
+    global train_df, val_df, versions, horizon
+
     print("🧪 Evaluating NeuralForecast TCN model...")
 
-    # 1. Hyperparameter Search Space
+    # Hyperparameters
     input_size    = trial.suggest_int("nf_input_size", 30, 180)
     num_blocks    = trial.suggest_int("nf_num_blocks", 1, 5)
     num_layers    = trial.suggest_int("nf_num_layers", 1, 4)
@@ -205,44 +206,82 @@ def eval_nf_tcn(trial):
     lr            = trial.suggest_loguniform("nf_lr", 1e-4, 1e-2)
     batch_size    = trial.suggest_categorical("nf_batch_size", [32, 64, 128])
 
-    # 2. Build the TCN Model
+    # Model
     print("📐 Building NeuralForecast TCN model...")
     tcn_model = NFTCN(
         input_size=input_size,
         h=horizon,
         kernel_size=kernel_size,
-        ## dilation_base=dilation_base,
-        ## dropout=dropout,
-        optimizer_params={"lr": lr},
         batch_size=batch_size
     )
 
-    print("🧠 Initializing NeuralForecast...")
-    nf = NeuralForecast(
-        models=[tcn_model],
-        freq="D",
-        ## callbacks={"early_stopping": {"monitor": "val_loss", "patience": 5, "mode": "min"}},
-        ### seed=42
-    )
+    nf = NeuralForecast(models=[tcn_model], freq="D")
 
-    # 3. Training
-    print("🏋️ Training with lr={} bs={}…".format(lr, batch_size))
-    history = nf.fit(
-        df=train_df,
-        ## val_df=val_df,
-        ## epochs=trial.suggest_int("nf_epochs", 10, 50),
-        verbose=False
-    )
+    # Fit
+    print(f"🏋️ Training with lr={lr} bs={batch_size}…")
+    nf.fit(df=train_df.copy(), verbose=False)
 
-    # 4. Forecasting & Evaluation
+    # Predict
     print("🔍 Forecasting…")
-    preds = nf.predict(df=val_df)
-    print("🔍 Merging predictions with validation set…")
-    merged = val_df.merge(preds, on=["ds", "unique_id"], how="inner")
+    preds = nf.predict(df=val_df.copy())
 
-    print("📊 Calculating MAE…")
-    mae = mean_absolute_error(merged["y"], merged["TCN"])
-    return mae
+    # Normalise join keys on copies
+    val_df_c = val_df.copy()
+    preds_c  = preds.copy()
+
+    val_df_c["unique_id"] = val_df_c["unique_id"].astype(str)
+    preds_c["unique_id"]  = preds_c["unique_id"].astype(str)
+    val_df_c["ds"]        = pd.to_datetime(val_df_c["ds"])
+    preds_c["ds"]         = pd.to_datetime(preds_c["ds"])
+
+    forecast_col = preds_c.columns.difference(["unique_id", "ds"])[0]
+
+    # --- 4b. Debugging before merge ---
+    print("\n=== DEBUG: val_df sample ===")
+    print(val_df_c.head(), val_df_c.dtypes)
+
+    print("\n=== DEBUG: preds sample ===")
+    print(preds_c.head(), preds_c.dtypes)
+
+    print("\n=== DEBUG: Unique IDs ===")
+    print("val_df IDs :", val_df_c["unique_id"].unique())
+    print("preds IDs  :", preds_c["unique_id"].unique())
+
+    print("\n=== DEBUG: Date ranges ===")
+    print("val_df min/max:", val_df_c["ds"].min(), val_df_c["ds"].max())
+    print("preds min/max :", preds_c["ds"].min(), preds_c["ds"].max())
+
+    # See if any exact (ID, ds) pairs match before merging
+    val_pairs   = set(zip(val_df_c["unique_id"], val_df_c["ds"]))
+    pred_pairs  = set(zip(preds_c["unique_id"], preds_c["ds"]))
+    intersection = val_pairs & pred_pairs
+    print(f"\n=== DEBUG: Overlapping (unique_id, ds) pairs: {len(intersection)} ===")
+    for i, pair in enumerate(sorted(intersection)[:10]):  # show first 10
+        print(pair)
+
+    print("🔍 Merging predictions with validation set…")
+    merged = val_df_c.merge(preds_c, on=["ds", "unique_id"], how="inner")
+
+    # Drop rows missing actual or forecast
+    merged = merged.dropna(subset=["y", forecast_col])
+
+    if merged.empty:
+        print("⚠️ No overlap at all — returning large MAE penalty")
+        return 1e6  # big number so trial is "bad" but not failed
+
+    # Per-ID MAE, skipping IDs with no overlap
+    per_id_mae = merged.groupby("unique_id").apply(
+        lambda g: mean_absolute_error(g["y"], g[forecast_col])
+    )
+
+    if per_id_mae.empty:
+        print("⚠️ No IDs with valid overlap — penalty")
+        return 1e6
+
+    avg_mae = per_id_mae.mean()
+    print(f"📈 Per-ID MAEs:\n{per_id_mae}\n🔹 Average MAE: {avg_mae}")
+
+    return avg_mae
 
 # 2C. CHRONOS Fine-tuning
 from autogluon.timeseries import TimeSeriesPredictor, TimeSeriesDataFrame
