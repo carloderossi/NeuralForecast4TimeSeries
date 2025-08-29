@@ -4,6 +4,6 @@ ts-chronos
 *.zip
 BCKUP/*
 __pycache__/
-lighting_logs/*
+lightning_logs/*
 .ipynb_checkpoints
 .DS_Store
