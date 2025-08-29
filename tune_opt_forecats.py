@@ -10,6 +10,19 @@ import os
 # Ensure offline mode for Hugging Face to avoid internet access issues
 # os.environ["HF_HUB_OFFLINE"] = "1"
 
+import random
+# from The Hitchhiker’s Guide to the Galaxy, where 42 is “the answer to life, the universe, and everything.”
+SEED = 42
+
+# 1. Python's own RNG
+random.seed(SEED)
+
+# 2. NumPy's RNG
+np.random.seed(SEED)
+
+# 3. PyTorch's RNG
+torch.manual_seed(SEED)
+
 horizon  = None
 val_df   = None
 train_df = None
@@ -29,8 +42,13 @@ class EstateDataset(Dataset):
         for uid, sdf in df.groupby("unique_id"):
             sdf = sdf.sort_values("ds").reset_index(drop=True)
             y_vals = sdf["y"].values
-            mask_vals = (~sdf["is_pad"]).astype(np.float32).values  # 1.0 = real, 0.0 = pad
-            
+
+            # If 'is_pad' exists, use it; otherwise create a False mask of same length
+            if "is_pad" in sdf.columns:
+                mask_vals = (~sdf["is_pad"]).astype(np.float32).values
+            else:
+                mask_vals = np.ones(len(sdf), dtype=np.float32)  # all real, no padding
+
             for i in range(len(sdf) - seq_len - horizon + 1):
                 x = y_vals[i:i+seq_len]
                 y = y_vals[i+seq_len:i+seq_len+horizon]
@@ -95,10 +113,17 @@ class TCNModel(nn.Module):
         out = self.tcn(x)[:, :, -1]
         return self.linear(out)
 
-def get_series(df, uid):
-    return df[df["unique_id"]==uid].sort_values("ds")["y"].values
+def get_series_df(df, uid):
+    """Return the full DataFrame slice for a given uid."""
+    return df[df["unique_id"] == uid][["unique_id", "ds", "y"]].copy()
+
+def get_series_y(df, uid):
+    """Return only the y‑values as a 1‑D NumPy array."""
+    return df[df["unique_id"] == uid]["y"].values  
 
 def eval_pytorch_tcn(trial):
+    global train_df, val_df, versions, horizon  # tell Python to use the globals
+
     print("🧪 Evaluating PyTorch TCN model...")
 
     # hyperparameters to tune
@@ -110,9 +135,11 @@ def eval_pytorch_tcn(trial):
                   for i in range(n_layers) ]
 
     print("📐 Building dataset and dataloader...")
-    train_series = [ get_series(train_df, v) for v in versions ]
-    ds            = EstateDataset(train_series, seq_len, horizon)
-    dl            = DataLoader(ds, batch_size=64, shuffle=True)
+    #### train_series = [ get_series(train_df, v) for v in versions ]
+    ##### ds = EstateDataset(train_series, seq_len, horizon)
+    train_series = pd.concat([get_series_df(train_df, v) for v in versions])
+    ds = EstateDataset(train_series, seq_len, horizon)
+    dl = DataLoader(ds, batch_size=64, shuffle=True)
 
     print("🧠 Initializing model and optimizer...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -144,13 +171,17 @@ def eval_pytorch_tcn(trial):
 
     with torch.no_grad():
         for v in versions:
-            series = get_series(train_df, v)   # full real training history
-            inp = torch.tensor(series[-seq_len:], dtype=torch.float32)\
-                    .unsqueeze(0).unsqueeze(0).to(device)
-            p = model(inp).cpu().numpy().flatten()
+            # ⬇️ Only take the y‑column values for model input
+            series_y = get_series_y(train_df, v)
+            #inp = torch.tensor(series_y[-seq_len:], dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
+            inp = torch.tensor(series_y[-seq_len:], dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
 
+            p = model(inp).cpu().numpy().flatten()
             preds.extend(p.tolist())
-            actuals.extend(get_series(val_df, v).tolist())
+
+            # Same here for actuals — just the target values
+            actual_y = get_series_y(val_df, v)
+            actuals.extend(actual_y.tolist())
 
     mae = mean_absolute_error(actuals, preds)
     return mae
@@ -160,20 +191,58 @@ from neuralforecast import NeuralForecast
 from neuralforecast.models import TCN as NFTCN
 
 def eval_nf_tcn(trial):
+    global train_df, val_df, versions, horizon  # tell Python to use the globals
     print("🧪 Evaluating NeuralForecast TCN model...")
-    input_size = trial.suggest_int("nf_input_size", 30, 180)
-    nf = NeuralForecast(
-        models=[ NFTCN(input_size=input_size, h=horizon) ],
-        freq="D"
+
+    # 1. Hyperparameter Search Space
+    input_size    = trial.suggest_int("nf_input_size", 30, 180)
+    num_blocks    = trial.suggest_int("nf_num_blocks", 1, 5)
+    num_layers    = trial.suggest_int("nf_num_layers", 1, 4)
+    num_filters   = trial.suggest_categorical("nf_num_filters", [16, 32, 64, 128])
+    kernel_size   = trial.suggest_int("nf_kernel_size", 2, 5)
+    dilation_base = trial.suggest_int("nf_dilation_base", 2, 4)
+    dropout       = trial.suggest_float("nf_dropout", 0.0, 0.5)
+    lr            = trial.suggest_loguniform("nf_lr", 1e-4, 1e-2)
+    batch_size    = trial.suggest_categorical("nf_batch_size", [32, 64, 128])
+
+    # 2. Build the TCN Model
+    print("📐 Building NeuralForecast TCN model...")
+    tcn_model = NFTCN(
+        input_size=input_size,
+        h=horizon,
+        kernel_size=kernel_size,
+        ## dilation_base=dilation_base,
+        ## dropout=dropout,
+        optimizer_params={"lr": lr},
+        batch_size=batch_size
     )
-    print("📈 Fitting NeuralForecast model...")
-    print("🏋️ Training model...")
-    nf.fit(train_df)
-    print("🔍 Forecasting...")
-    pred = nf.predict()
-    merged = val_df.merge(pred, on=["ds","unique_id"])
-    print("📊 Calculating MAE...")
-    return mean_absolute_error(merged["y"], merged["TCN"])
+
+    print("🧠 Initializing NeuralForecast...")
+    nf = NeuralForecast(
+        models=[tcn_model],
+        freq="D",
+        ## callbacks={"early_stopping": {"monitor": "val_loss", "patience": 5, "mode": "min"}},
+        ### seed=42
+    )
+
+    # 3. Training
+    print("🏋️ Training with lr={} bs={}…".format(lr, batch_size))
+    history = nf.fit(
+        df=train_df,
+        ## val_df=val_df,
+        ## epochs=trial.suggest_int("nf_epochs", 10, 50),
+        verbose=False
+    )
+
+    # 4. Forecasting & Evaluation
+    print("🔍 Forecasting…")
+    preds = nf.predict(df=val_df)
+    print("🔍 Merging predictions with validation set…")
+    merged = val_df.merge(preds, on=["ds", "unique_id"], how="inner")
+
+    print("📊 Calculating MAE…")
+    mae = mean_absolute_error(merged["y"], merged["TCN"])
+    return mae
 
 # 2C. CHRONOS Fine-tuning
 from autogluon.timeseries import TimeSeriesPredictor, TimeSeriesDataFrame
@@ -181,6 +250,7 @@ import pandas as pd
 from sklearn.metrics import mean_absolute_error
 
 def eval_chronos(trial):
+    global train_df, val_df, versions, horizon  # tell Python to use the globals
     print("🧪 Evaluating Chronos model...")
     # 1️⃣ Pick a CPU‐compatible Chronos-Bolt preset
     cpu_presets = ["bolt_tiny", "bolt_mini", "bolt_small", "bolt_base"]
@@ -257,11 +327,19 @@ def objective(trial):
         return eval_nf_tcn(trial)
     return eval_chronos(trial)
 
+TARGET_MAE = 0.5  # your desired floor for MAE
+
+def stop_when_mae_reached(study: optuna.study.Study, trial: optuna.trial.FrozenTrial):
+    if study.best_value is not None and study.best_value <= TARGET_MAE:
+        print(f"🎯 Target MAE {TARGET_MAE} reached (best={study.best_value:.4f}). Stopping study.")
+        study.stop()
+
+
 def main():
     # --------------------------------------------------------------------------------
     # 1. LOAD & PREPROCESS
     # --------------------------------------------------------------------------------
-
+    global train_df, val_df, versions, horizon  # tell Python to use the globals
     print("📥 Loading raw CSV data...")
     raw = pd.read_csv("daily_data.csv", parse_dates=["date"])
 
@@ -287,6 +365,9 @@ def main():
     val_df   = df[(df["ds"] >  (max_date - pd.Timedelta(days=horizon))) &
                 (df["ds"] <= max_date)]
 
+    print(f"🧮 Training set: {train_df.shape[0]} rows")
+    print(f"🧮 Validation set: {val_df.shape[0]} rows")
+    
     versions = df["unique_id"].unique().tolist()
     print(f"🧬 Found {len(versions)} unique versions.")
 
@@ -305,7 +386,10 @@ def main():
 
     # •	Runs up to XX trials or until HH hours has passed.
     # •	Each trial randomly selects a model and hyperparameters, then evaluates performance.
-    study.optimize(objective, n_trials=50, timeout=36000) ## XX trials, HH hours
+    study.optimize(objective, 
+                   n_trials=75, 
+                   # callbacks=[stop_when_mae_reached], use it to call the fuction "stop_when_mae_reached" 
+                   timeout=36000) ## XX trials, HH hours
 
     print("🏆 Best trial parameters:", study.best_trial.params)
     print("📉 Best MAE:", study.best_value)
