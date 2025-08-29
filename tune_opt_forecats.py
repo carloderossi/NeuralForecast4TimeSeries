@@ -436,10 +436,10 @@ def main():
 
     print("\n📅 Validation date ranges by unique_id:")
     print(val_df.groupby("unique_id")["ds"].agg(['min', 'max']))
-    print("\n")
-
+    
     print(val_df.columns)
     print(val_df.head())
+    print("\n")
 
     versions = df["unique_id"].unique().tolist()
     print(f"🧬 Found {len(versions)} unique versions.")
