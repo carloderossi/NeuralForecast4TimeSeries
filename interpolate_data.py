@@ -97,7 +97,7 @@ def read_and_interpolate_csv(input_file, output_file):
                     base_value = daily_values[day - 1]
                     
                     # Add random error between -2% and +2% (reduce from ±10% to ±2%)
-                    noise_factor = np.random.uniform(0.98, 1.02)
+                    noise_factor = np.random.uniform(0.999, 1.001)  # Reduced to ±0.1%
                     noisy_value = base_value * noise_factor
                     
                     daily_data.append({
